@@ -10,6 +10,13 @@ const PLUGIN_ID = '@scrypted/core';
 const RECONNECT_MIN_MS = 5_000;
 const RECONNECT_MAX_MS = 5 * 60_000;
 const CONNECT_TIMEOUT_MS = 60_000;
+/**
+ * Deadline for the short-lived connection pairing lists devices over. Pairing falls back to
+ * the live copy when it expires, and the user is staring at a spinner meanwhile; the live
+ * connection being up already says the server is reachable, so a slow second login is far
+ * likelier stuck than merely slow.
+ */
+const LISTING_CONNECT_TIMEOUT_MS = 15_000;
 
 /**
  * Marks an attempt the hub abandoned on purpose. It reports, but arms no retry: whatever
@@ -197,6 +204,7 @@ export class ScryptedHub extends EventEmitter {
     config: ScryptedConfig,
     baseUrl: string,
     clientName: string,
+    timeoutMs = CONNECT_TIMEOUT_MS,
   ): Promise<ScryptedClientStatic> {
     let abandoned = false;
     let timer: NodeJS.Timeout | undefined;
@@ -230,8 +238,8 @@ export class ScryptedHub extends EventEmitter {
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             abandoned = true;
-            reject(new Error(`Connecting to Scrypted timed out after ${CONNECT_TIMEOUT_MS / 1000}s.`));
-          }, CONNECT_TIMEOUT_MS);
+            reject(new Error(`Connecting to Scrypted timed out after ${timeoutMs / 1000}s.`));
+          }, timeoutMs);
           timer.unref?.();
         }),
       ]);
@@ -378,32 +386,68 @@ export class ScryptedHub extends EventEmitter {
    * Lists every device known to Scrypted, optionally restricted to a set of device types.
    * Reads the system state directly rather than instantiating a proxy per device, which
    * keeps pairing cheap on servers with a hundred-odd devices.
+   *
+   * This is the live connection's copy of that state, which can be out of date: see
+   * `listDevicesFresh`, which pairing uses instead.
    */
   async listDevices(types?: readonly string[]): Promise<ScryptedDeviceSummary[]> {
     const client = await this.getClient();
-    const state = client.systemManager.getSystemState();
-    const wanted = types ? new Set<string>(types) : null;
-    const summaries: ScryptedDeviceSummary[] = [];
+    return summarise(client.systemManager.getSystemState(), types);
+  }
 
-    for (const id of Object.keys(state)) {
-      const entry = state[id];
-      const type = entry?.[ScryptedInterfaceProperty.type]?.value as string | undefined;
-      const name = entry?.[ScryptedInterfaceProperty.name]?.value as string | undefined;
-      const interfaces = entry?.[ScryptedInterfaceProperty.interfaces]?.value as string[] | undefined;
+  /**
+   * Lists devices from a state read just now, on a short-lived second connection.
+   *
+   * The live connection's state is a copy that Scrypted is meant to keep current by pushing
+   * every addition and removal. That push can stop arriving while the socket otherwise stays
+   * healthy: detections kept flowing for six days while two cameras deleted on the server
+   * stayed in the copy and a newly added one never appeared, so pairing offered the deleted
+   * cameras and not the new one. Why the push stopped is not known; a fresh read does not
+   * depend on knowing it.
+   *
+   * When the fresh read disagrees with the live copy, the live connection is rebuilt so the
+   * paired devices resync as well — one bound to a deleted camera otherwise keeps reporting
+   * itself available. The caller gets the fresh list without waiting for that rebuild.
+   */
+  async listDevicesFresh(types?: readonly string[]): Promise<{
+    devices: ScryptedDeviceSummary[];
+    /** Whether the live copy was found out of date, and a reconnect started to replace it. */
+    stale: boolean;
+  }> {
+    const live = await this.getClient();
+    const config = this.config;
+    if (!config) throw new Error('Scrypted is not configured.');
 
-      if (!type || !name || !interfaces) continue;
-      if (wanted && !wanted.has(type)) continue;
-
-      summaries.push({
-        id,
-        name,
-        type,
-        interfaces,
-        room: entry?.[ScryptedInterfaceProperty.room]?.value as string | undefined,
-      });
+    const client = await this.connectWithDeadline(
+      config,
+      `https://${config.host}:${config.port}`,
+      'Homey (device list)',
+      LISTING_CONNECT_TIMEOUT_MS,
+    ).catch(err => {
+      // Flattened like `probe()` does: the trace pairing records would otherwise carry the
+      // aggregate's fixed "All promises were rejected" and nothing else.
+      throw new Error(describeConnectFailure(err), { cause: err });
+    });
+    let fresh: SystemState;
+    try {
+      fresh = client.systemManager.getSystemState();
+    } finally {
+      client.disconnect();
     }
 
-    return summaries.sort((a, b) => a.name.localeCompare(b.name));
+    // Repaired onto another server while this read was in flight: the list describes the
+    // server the hub just left, and its ids mean nothing on the new one.
+    if (this.config !== config) throw new Error('The Scrypted server changed while listing devices.');
+
+    // Compared against the client the read started from: if the hub reconnected meanwhile,
+    // its new copy is already fresh and there is nothing to repair.
+    const stale = this.client === live && !sameKeys(live.systemManager.getSystemState(), fresh);
+    if (stale) {
+      this.log('The live Scrypted device list was out of date; reconnecting to refresh it.');
+      this.reconnectNow().catch(err => this.logError('Refresh reconnect failed:', (err as Error).message));
+    }
+
+    return { devices: summarise(fresh, types), stale };
   }
 
   /** Stops reconnecting and closes the socket. Called when the Homey app unloads. */
@@ -425,4 +469,39 @@ export class ScryptedHub extends EventEmitter {
     this.client = null;
     this.removeAllListeners();
   }
+}
+
+type SystemState = ReturnType<ScryptedClientStatic['systemManager']['getSystemState']>;
+
+/** Turns a Scrypted system state into the summaries pairing works with, sorted by name. */
+function summarise(state: SystemState, types?: readonly string[]): ScryptedDeviceSummary[] {
+  const wanted = types ? new Set<string>(types) : null;
+  const summaries: ScryptedDeviceSummary[] = [];
+
+  for (const id of Object.keys(state)) {
+    const entry = state[id];
+    const type = entry?.[ScryptedInterfaceProperty.type]?.value as string | undefined;
+    const name = entry?.[ScryptedInterfaceProperty.name]?.value as string | undefined;
+    const interfaces = entry?.[ScryptedInterfaceProperty.interfaces]?.value as string[] | undefined;
+
+    if (!type || !name || !interfaces) continue;
+    if (wanted && !wanted.has(type)) continue;
+
+    summaries.push({
+      id,
+      name,
+      type,
+      interfaces,
+      room: entry?.[ScryptedInterfaceProperty.room]?.value as string | undefined,
+    });
+  }
+
+  return summaries.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Whether two system states hold the same set of device ids. */
+function sameKeys(a: object, b: object): boolean {
+  const left = Object.keys(a);
+  const right = new Set(Object.keys(b));
+  return left.length === right.size && left.every(key => right.has(key));
 }

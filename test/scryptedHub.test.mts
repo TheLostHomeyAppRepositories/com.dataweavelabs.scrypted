@@ -641,3 +641,133 @@ test('a reason that cannot be described still leaves a retry armed', async () =>
   assert.notEqual(hub.lastError, null, 'the failure should still have been recorded');
   hub.destroy();
 });
+
+/** A system state entry as Scrypted reports it, reduced to what pairing reads. */
+function camera(name: string) {
+  return {
+    type: { value: 'Camera' },
+    name: { value: name },
+    interfaces: { value: ['Camera', 'VideoCamera'] },
+  };
+}
+
+/** A client whose system state is the given one. */
+function clientWithState(state: Record<string, unknown>) {
+  const client = fakeClient();
+  client.systemManager = { getSystemState: () => state };
+  return client;
+}
+
+test('pairing lists the server as it is now, not the live copy, and resyncs a stale copy', async () => {
+  // The live copy still holds two cameras deleted on the server and misses the one added
+  // since — what the app was found holding after six days on one connection.
+  const live = clientWithState({ 75: camera('Tapo C210'), 76: camera('E1 Pro'), 77: camera('I61DQ') });
+  const fresh = clientWithState({ 76: camera('E1 Pro'), 90: camera('Salon') });
+  const clients = [live, fresh, fresh];
+  let connects = 0;
+
+  const hub = new ScryptedHub({ connect: async () => clients[connects++] as never });
+  await hub.setConfig(CONFIG);
+  let disconnects = 0;
+  hub.on('disconnected', () => { disconnects += 1; });
+
+  const { devices, stale } = await hub.listDevicesFresh(['Camera']);
+  await flush();
+
+  assert.deepEqual(devices.map(d => d.name), ['E1 Pro', 'Salon']);
+  assert.equal(stale, true);
+  assert.equal(disconnects, 1, 'the paired devices were not told to resync');
+  assert.equal(connects, 3, 'the stale live connection was not replaced');
+  assert.equal(live.disconnected, true);
+  hub.destroy();
+});
+
+test('a fresh list matching the live copy leaves the connection alone', async () => {
+  const state = { 76: camera('E1 Pro') };
+  const live = clientWithState(state);
+  const fresh = clientWithState({ ...state });
+  const clients = [live, fresh];
+  let connects = 0;
+
+  const hub = new ScryptedHub({ connect: async () => clients[connects++] as never });
+  await hub.setConfig(CONFIG);
+
+  const { devices, stale } = await hub.listDevicesFresh(['Camera']);
+  await flush();
+
+  assert.deepEqual(devices.map(d => d.name), ['E1 Pro']);
+  assert.equal(stale, false);
+  assert.equal(connects, 2);
+  assert.equal(fresh.disconnected, true, 'the listing connection was left open');
+  assert.equal(live.disconnected, false, 'cameras were interrupted for nothing');
+  hub.destroy();
+});
+
+test('a stale copy is caught even when as many devices were added as were removed', async () => {
+  // Two deleted and two added leaves the count unchanged, so counting is not enough.
+  const live = clientWithState({ 75: camera('Tapo C210'), 76: camera('E1 Pro') });
+  const fresh = clientWithState({ 76: camera('E1 Pro'), 90: camera('Salon') });
+  const clients = [live, fresh, clientWithState({})];
+  let connects = 0;
+
+  const hub = new ScryptedHub({ connect: async () => clients[connects++] as never });
+  await hub.setConfig(CONFIG);
+
+  const { stale } = await hub.listDevicesFresh(['Camera']);
+  await flush();
+
+  assert.equal(stale, true);
+  assert.equal(connects, 3);
+  hub.destroy();
+});
+
+test('a listing that outlives the hub neither reconnects nor leaves its socket open', async () => {
+  const live = clientWithState({ 75: camera('Tapo C210') });
+  const fresh = clientWithState({ 90: camera('Salon') });
+  const held = deferred();
+  let connects = 0;
+
+  const hub = new ScryptedHub({
+    connect: async () => {
+      connects += 1;
+      if (connects === 1) return live as never;
+      await held.promise;
+      return fresh as never;
+    },
+  });
+  await hub.setConfig(CONFIG);
+
+  const listing = hub.listDevicesFresh(['Camera']);
+  await flush();
+  hub.destroy();
+  held.release();
+
+  const { stale } = await listing;
+  await flush();
+
+  assert.equal(stale, false, 'a destroyed hub was asked to reconnect');
+  assert.equal(connects, 2);
+  assert.equal(fresh.disconnected, true, 'the listing connection was left open');
+});
+
+test('a listing that outlives a repair is refused rather than describing the old server', async () => {
+  const held = deferred();
+  let connects = 0;
+
+  const hub = new ScryptedHub({
+    connect: async () => {
+      connects += 1;
+      if (connects === 2) await held.promise;
+      return clientWithState({ 90: camera('Salon') }) as never;
+    },
+  });
+  await hub.setConfig({ ...CONFIG, host: 'old.host' });
+
+  const listing = hub.listDevicesFresh(['Camera']);
+  await flush();
+  await hub.setConfig({ ...CONFIG, host: 'new.host' });
+  held.release();
+
+  await assert.rejects(listing, /server changed/);
+  hub.destroy();
+});
