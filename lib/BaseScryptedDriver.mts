@@ -100,6 +100,8 @@ export abstract class BaseScryptedDriver extends Homey.Driver {
   /**
    * Lists the Scrypted devices this driver can adopt, excluding ones Homey already has.
    * Matching is by Scrypted device id, which survives renames on the Scrypted side.
+   * The list is read afresh from the server rather than from the live connection's copy,
+   * which can lag behind it (see `ScryptedHub.listDevicesFresh`).
    *
    * The returned objects must contain only the keys Homey accepts for a pairing result:
    * name, data, store, settings, icon, capabilities and capabilitiesOptions. Homey rejects
@@ -123,7 +125,19 @@ export abstract class BaseScryptedDriver extends Homey.Driver {
       this.getDevices().map(device => (device.getData() as { id?: string }).id).filter(Boolean),
     );
 
-    const candidates = await this.hub.listDevices(typesForDriver(this.driverId));
+    const types = typesForDriver(this.driverId);
+    // A failed fresh read still leaves the live copy, which is right far more often than
+    // not; refusing to pair over it would trade a rare stale entry for no list at all.
+    const candidates = await this.hub.listDevicesFresh(types).then(
+      ({ devices, stale }) => {
+        if (stale) this.trace('device list was out of date; reconnecting to resync paired devices');
+        return devices;
+      },
+      err => {
+        this.trace(`fresh device list FAILED, using the live copy: ${(err as Error).message}`);
+        return this.hub.listDevices(types);
+      },
+    );
 
     return candidates
       .filter(candidate => !alreadyPaired.has(candidate.id))
